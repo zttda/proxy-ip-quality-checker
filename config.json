@@ -1,0 +1,7 @@
+{
+  "proxyHost": "127.0.0.1",
+  "proxyPort": 7897,
+  "timeoutSeconds": 20,
+  "saveJson": false,
+  "pauseOnExit": true
+}
