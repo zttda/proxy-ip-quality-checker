@@ -18,6 +18,8 @@ import (
 	"text/tabwriter"
 	"time"
 	"unicode"
+
+	xproxy "golang.org/x/net/proxy"
 )
 
 var version = "dev"
@@ -28,13 +30,21 @@ const (
 	chatGPTEndpoint  = "https://chatgpt.com/cdn-cgi/trace"
 	googleEndpoint   = "https://www.google.com/generate_204"
 	maxResponseBytes = 2 << 20
+	protocolAuto     = "auto"
+	protocolHTTP     = "http"
+	protocolSOCKS5   = "socks5"
+	protocolDirect   = "direct"
+	checkModeQuick   = "quick"
+	checkModeFull    = "ipquality"
 )
 
 type config struct {
 	ProxyHost   string `json:"proxyHost"`
 	ProxyPort   int    `json:"proxyPort"`
+	Protocol    string `json:"proxyProtocol"`
+	Direct      bool   `json:"directConnection"`
+	CheckMode   string `json:"checkMode"`
 	Timeout     int    `json:"timeoutSeconds"`
-	SaveJSON    bool   `json:"saveJson"`
 	PauseOnExit bool   `json:"pauseOnExit"`
 }
 
@@ -86,6 +96,9 @@ type checkResult struct {
 type report struct {
 	GeneratedAt       time.Time   `json:"generatedAt"`
 	Version           string      `json:"version"`
+	ProxyHost         string      `json:"proxyHost"`
+	ProxyPort         int         `json:"proxyPort"`
+	ProxyProtocol     string      `json:"proxyProtocol"`
 	LatencyMS         int64       `json:"latencyMs"`
 	Intel             intelData   `json:"intel"`
 	Blackbox          checkResult `json:"independentReputation"`
@@ -95,7 +108,7 @@ type report struct {
 	AssessmentReasons []string    `json:"assessmentReasons"`
 }
 
-func main() {
+func cliMain() {
 	initConsole()
 
 	noPause := flag.Bool("no-pause", false, "do not wait for Enter before exiting")
@@ -134,8 +147,10 @@ func defaultConfig() config {
 	return config{
 		ProxyHost:   "127.0.0.1",
 		ProxyPort:   7897,
+		Protocol:    protocolAuto,
+		Direct:      false,
+		CheckMode:   checkModeQuick,
 		Timeout:     20,
-		SaveJSON:    false,
 		PauseOnExit: true,
 	}
 }
@@ -175,16 +190,62 @@ func loadConfig(path string) (config, bool, error) {
 }
 
 func validateConfig(cfg config) error {
-	if net.ParseIP(cfg.ProxyHost) == nil && !validHostname(cfg.ProxyHost) {
-		return errors.New("proxyHost must be an IPv4 address or hostname")
-	}
-	if cfg.ProxyPort < 1 || cfg.ProxyPort > 65535 {
-		return errors.New("proxyPort must be between 1 and 65535")
+	if !cfg.Direct {
+		if net.ParseIP(cfg.ProxyHost) == nil && !validHostname(cfg.ProxyHost) {
+			return errors.New("proxyHost must be an IPv4 address or hostname")
+		}
+		if cfg.ProxyPort < 1 || cfg.ProxyPort > 65535 {
+			return errors.New("proxyPort must be between 1 and 65535")
+		}
 	}
 	if cfg.Timeout < 5 || cfg.Timeout > 120 {
 		return errors.New("timeoutSeconds must be between 5 and 120")
 	}
+	switch normalizeProtocol(cfg.Protocol) {
+	case protocolAuto, protocolHTTP, protocolSOCKS5:
+	default:
+		return errors.New("proxyProtocol must be auto, http, or socks5")
+	}
+	switch normalizeCheckMode(cfg.CheckMode) {
+	case checkModeQuick, checkModeFull:
+	default:
+		return errors.New("checkMode must be quick or ipquality")
+	}
 	return nil
+}
+
+func normalizeProtocol(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" || value == "mixed" {
+		return protocolAuto
+	}
+	return value
+}
+
+func configConnectionProtocol(cfg config) string {
+	if cfg.Direct {
+		return protocolDirect
+	}
+	return normalizeProtocol(cfg.Protocol)
+}
+
+func configConnectionSummary(cfg config) string {
+	protocol := configConnectionProtocol(cfg)
+	if protocol == protocolDirect {
+		return "本机直连（未使用代理）"
+	}
+	return net.JoinHostPort(cfg.ProxyHost, strconv.Itoa(cfg.ProxyPort)) + "，" + protocolDisplayName(protocol)
+}
+
+func normalizeCheckMode(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" || value == "fast" {
+		return checkModeQuick
+	}
+	if value == "full" {
+		return checkModeFull
+	}
+	return value
 }
 
 func validHostname(value string) bool {
@@ -208,46 +269,117 @@ func validHostname(value string) bool {
 
 func run(cfg config, configPath string) int {
 	fmt.Printf("Proxy IP Quality Check %s\n", version)
-	fmt.Printf("Proxy: http://%s:%d\n\n", cfg.ProxyHost, cfg.ProxyPort)
+	if cfg.Direct {
+		fmt.Println("Connection: " + configConnectionSummary(cfg))
+	} else {
+		fmt.Printf("Proxy: %s:%d (%s)\n", cfg.ProxyHost, cfg.ProxyPort, protocolDisplayName(normalizeProtocol(cfg.Protocol)))
+	}
+	fmt.Printf("Mode: %s\n\n", checkModeDisplayNameForCLI(cfg.CheckMode))
 
-	client, err := newProxyClient(cfg)
+	if normalizeCheckMode(cfg.CheckMode) == checkModeFull {
+		return runIPQualityCLI(cfg, filepath.Dir(configPath))
+	}
+
+	result, err := performCheck(context.Background(), cfg, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		if saveErr := saveLatestFailure(filepath.Dir(configPath), cfg, err); saveErr != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: could not save failure report: %v\n", saveErr)
+		}
 		return 1
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Timeout)*time.Second)
-	start := time.Now()
-	intel, err := fetchIntel(ctx, client)
-	cancel()
-	latency := time.Since(start)
+	printReport(result)
+	if err := saveLatestSuccess(filepath.Dir(configPath), cfg, result); err != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: could not save result files: %v\n", err)
+	} else {
+		fmt.Printf("\nSaved report: %s\n", filepath.Join(filepath.Dir(configPath), latestHTMLName))
+	}
+	return 0
+}
+
+func runIPQualityCLI(cfg config, directory string) int {
+	result, err := performIPQualityCheck(context.Background(), directory, cfg, func(percent int, message string) {
+		fmt.Fprintf(os.Stderr, "[%3d%%] %s\n", percent, message)
+	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: primary IP intelligence check failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		if saveErr := saveIPQualityFailure(directory, err); saveErr != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: could not save failure details: %v\n", saveErr)
+		}
 		return 1
 	}
+	if err := saveLatestIPQuality(directory, result); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: could not save IPQuality reports: %v\n", err)
+		return 1
+	}
+	fmt.Println(result.PlainText)
+	fmt.Printf("\nSaved report: %s\n", filepath.Join(directory, ipqualityHTMLName))
+	return 0
+}
+
+func checkModeDisplayNameForCLI(mode string) string {
+	if normalizeCheckMode(mode) == checkModeFull {
+		return "IPQuality full / IPQuality 完整检测"
+	}
+	return "quick / 快速检测"
+}
+
+type progressFunc func(percent int, message string)
+
+func performCheck(parent context.Context, cfg config, progress progressFunc) (report, error) {
+	if err := validateConfig(cfg); err != nil {
+		return report{}, err
+	}
+	cfg.Protocol = normalizeProtocol(cfg.Protocol)
+	notifyProgress(progress, 5, "正在连接检测服务")
+
+	client, intel, usedProtocol, latency, err := connectAndFetchIntel(parent, cfg, progress)
+	if err != nil {
+		return report{}, fmt.Errorf("网络连接或公网 IP 查询失败: %w", err)
+	}
+	defer client.CloseIdleConnections()
+
+	notifyProgress(progress, 50, "正在查询信誉与可用性")
+	type auxiliaryResult struct {
+		name  string
+		value checkResult
+	}
+	results := make(chan auxiliaryResult, 3)
+	go func() {
+		results <- auxiliaryResult{"blackbox", checkBlackbox(parent, client, intel.Data.IP, cfg.Timeout)}
+	}()
+	go func() {
+		results <- auxiliaryResult{"chatgpt", checkChatGPT(parent, client, cfg.Timeout)}
+	}()
+	go func() {
+		results <- auxiliaryResult{"google", checkGoogle(parent, client, cfg.Timeout)}
+	}()
 
 	var blackbox, chatGPT, google checkResult
-	done := make(chan struct{}, 3)
-	go func() {
-		blackbox = checkBlackbox(client, intel.Data.IP, cfg.Timeout)
-		done <- struct{}{}
-	}()
-	go func() {
-		chatGPT = checkChatGPT(client, cfg.Timeout)
-		done <- struct{}{}
-	}()
-	go func() {
-		google = checkGoogle(client, cfg.Timeout)
-		done <- struct{}{}
-	}()
-	for range 3 {
-		<-done
+	for index := 0; index < 3; index++ {
+		item := <-results
+		switch item.name {
+		case "blackbox":
+			blackbox = item.value
+		case "chatgpt":
+			chatGPT = item.value
+		case "google":
+			google = item.value
+		}
+		notifyProgress(progress, 60+(index+1)*10, "正在汇总检测结果")
+	}
+	if err := parent.Err(); err != nil {
+		return report{}, err
 	}
 
 	assessment, reasons := assess(intel.Data.Security, blackbox)
 	result := report{
 		GeneratedAt:       time.Now().UTC(),
 		Version:           version,
+		ProxyHost:         cfg.ProxyHost,
+		ProxyPort:         cfg.ProxyPort,
+		ProxyProtocol:     usedProtocol,
 		LatencyMS:         latency.Milliseconds(),
 		Intel:             intel.Data,
 		Blackbox:          blackbox,
@@ -256,32 +388,111 @@ func run(cfg config, configPath string) int {
 		Assessment:        assessment,
 		AssessmentReasons: reasons,
 	}
-
-	printReport(result)
-	if cfg.SaveJSON {
-		outputPath := filepath.Join(filepath.Dir(configPath), "ipcheck-result.json")
-		if err := saveReport(outputPath, result); err != nil {
-			fmt.Fprintf(os.Stderr, "WARNING: could not save JSON report: %v\n", err)
-		} else {
-			fmt.Printf("\nJSON report: %s\n", outputPath)
-		}
-	}
-	return 0
+	notifyProgress(progress, 100, "检测完成")
+	return result, nil
 }
 
-func newProxyClient(cfg config) (*http.Client, error) {
-	proxyAddress := "http://" + net.JoinHostPort(cfg.ProxyHost, strconv.Itoa(cfg.ProxyPort))
-	proxyURL, err := url.Parse(proxyAddress)
-	if err != nil {
-		return nil, fmt.Errorf("parse proxy URL: %w", err)
+func connectAndFetchIntel(parent context.Context, cfg config, progress progressFunc) (*http.Client, intelResponse, string, time.Duration, error) {
+	requestedProtocol := configConnectionProtocol(cfg)
+	protocols := []string{requestedProtocol}
+	if requestedProtocol == protocolAuto {
+		protocols = []string{protocolHTTP, protocolSOCKS5}
 	}
+
+	errorsByProtocol := make([]string, 0, len(protocols))
+	for index, candidate := range protocols {
+		if err := parent.Err(); err != nil {
+			return nil, intelResponse{}, "", 0, err
+		}
+		notifyProgress(progress, 10+index*15, "正在验证连接方式："+protocolDisplayName(candidate))
+		client, err := newConnectionClient(cfg, candidate)
+		if err != nil {
+			errorsByProtocol = append(errorsByProtocol, protocolDisplayName(candidate)+": "+err.Error())
+			continue
+		}
+
+		attemptTimeout := cfg.Timeout
+		if requestedProtocol == protocolAuto && attemptTimeout > 8 {
+			attemptTimeout = 8
+		}
+		ctx, cancel := context.WithTimeout(parent, time.Duration(attemptTimeout)*time.Second)
+		start := time.Now()
+		intel, fetchErr := fetchIntel(ctx, client)
+		latency := time.Since(start)
+		cancel()
+		if fetchErr == nil {
+			notifyProgress(progress, 40, "已确认连接方式："+protocolDisplayName(candidate))
+			return client, intel, candidate, latency, nil
+		}
+		client.CloseIdleConnections()
+		if errors.Is(fetchErr, context.Canceled) && parent.Err() != nil {
+			return nil, intelResponse{}, "", 0, parent.Err()
+		}
+		errorsByProtocol = append(errorsByProtocol, protocolDisplayName(candidate)+": "+sanitize(fetchErr.Error()))
+	}
+
+	return nil, intelResponse{}, "", 0, errors.New(strings.Join(errorsByProtocol, "; "))
+}
+
+func newConnectionClient(cfg config, protocol string) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = http.ProxyURL(proxyURL)
+	transport.Proxy = nil
 	transport.ResponseHeaderTimeout = time.Duration(cfg.Timeout) * time.Second
+	transport.TLSHandshakeTimeout = time.Duration(cfg.Timeout) * time.Second
+
+	switch normalizeProtocol(protocol) {
+	case protocolDirect:
+		// Proxy remains nil so direct checks also ignore HTTP_PROXY/HTTPS_PROXY.
+	case protocolHTTP:
+		proxyAddress := net.JoinHostPort(cfg.ProxyHost, strconv.Itoa(cfg.ProxyPort))
+		proxyURL, err := url.Parse("http://" + proxyAddress)
+		if err != nil {
+			return nil, fmt.Errorf("parse proxy URL: %w", err)
+		}
+		transport.Proxy = http.ProxyURL(proxyURL)
+	case protocolSOCKS5:
+		proxyAddress := net.JoinHostPort(cfg.ProxyHost, strconv.Itoa(cfg.ProxyPort))
+		baseDialer := &net.Dialer{
+			Timeout:   time.Duration(cfg.Timeout) * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
+		dialer, err := xproxy.SOCKS5("tcp", proxyAddress, nil, baseDialer)
+		if err != nil {
+			return nil, fmt.Errorf("create SOCKS5 dialer: %w", err)
+		}
+		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			if contextDialer, ok := dialer.(xproxy.ContextDialer); ok {
+				return contextDialer.DialContext(ctx, network, address)
+			}
+			return dialer.Dial(network, address)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported connection protocol %q", protocol)
+	}
+
 	return &http.Client{
 		Transport: transport,
 		Timeout:   time.Duration(cfg.Timeout) * time.Second,
 	}, nil
+}
+
+func notifyProgress(progress progressFunc, percent int, message string) {
+	if progress != nil {
+		progress(percent, message)
+	}
+}
+
+func protocolDisplayName(protocol string) string {
+	switch normalizeProtocol(protocol) {
+	case protocolDirect:
+		return "本机直连"
+	case protocolHTTP:
+		return "HTTP / Mixed"
+	case protocolSOCKS5:
+		return "SOCKS5"
+	default:
+		return "自动识别"
+	}
 }
 
 func fetchIntel(ctx context.Context, client *http.Client) (intelResponse, error) {
@@ -302,8 +513,8 @@ func fetchIntel(ctx context.Context, client *http.Client) (intelResponse, error)
 	return response, nil
 }
 
-func checkBlackbox(client *http.Client, ip string, timeout int) checkResult {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+func checkBlackbox(parent context.Context, client *http.Client, ip string, timeout int) checkResult {
+	ctx, cancel := context.WithTimeout(parent, time.Duration(timeout)*time.Second)
 	defer cancel()
 	body, status, err := get(ctx, client, blackboxEndpoint+url.PathEscape(ip))
 	if err != nil {
@@ -315,16 +526,16 @@ func checkBlackbox(client *http.Client, ip string, timeout int) checkResult {
 	value := strings.TrimSpace(string(body))
 	switch value {
 	case "Y":
-		return checkResult{Available: true, Value: "block recommended / 建议拦截"}
+		return checkResult{Available: true, Value: "block"}
 	case "N":
-		return checkResult{Available: true, Value: "allow / 建议放行"}
+		return checkResult{Available: true, Value: "allow"}
 	default:
 		return unavailable(fmt.Errorf("unexpected response %q", value))
 	}
 }
 
-func checkChatGPT(client *http.Client, timeout int) checkResult {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+func checkChatGPT(parent context.Context, client *http.Client, timeout int) checkResult {
+	ctx, cancel := context.WithTimeout(parent, time.Duration(timeout)*time.Second)
 	defer cancel()
 	body, status, err := get(ctx, client, chatGPTEndpoint)
 	if err != nil {
@@ -336,13 +547,13 @@ func checkChatGPT(client *http.Client, timeout int) checkResult {
 	fields := parseKeyValues(string(body))
 	location := fields["loc"]
 	if location == "" {
-		location = "unknown region"
+		location = "unknown"
 	}
-	return checkResult{Available: true, Value: "reachable, region " + location}
+	return checkResult{Available: true, Value: location}
 }
 
-func checkGoogle(client *http.Client, timeout int) checkResult {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+func checkGoogle(parent context.Context, client *http.Client, timeout int) checkResult {
+	ctx, cancel := context.WithTimeout(parent, time.Duration(timeout)*time.Second)
 	defer cancel()
 	_, status, err := get(ctx, client, googleEndpoint)
 	if err != nil {
@@ -488,14 +699,6 @@ func displayCheck(value checkResult) string {
 
 func unavailable(err error) checkResult {
 	return checkResult{Available: false, Error: err.Error()}
-}
-
-func saveReport(path string, value report) error {
-	content, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, append(content, '\n'), 0o600)
 }
 
 func pauseIfNeeded(enabled, disabledByFlag bool) {

@@ -1,9 +1,19 @@
 * text=auto
 *.go text eol=lf
 *.json text eol=lf
+*.ps1 text eol=lf
+*.sh text eol=lf
+*.txt text eol=lf
+*.ico binary
+*.png binary
+*.manifest text eol=lf
 *.md text eol=lf
 *.yml text eol=lf
+*.syso binary
 .gitignore text eol=lf
 .gitattributes text eol=lf
 LICENSE text eol=lf
+THIRD_PARTY_NOTICES.txt text eol=lf
 go.mod text eol=lf
+go.sum text eol=lf
+third_party/ipquality/shims/* text eol=lf

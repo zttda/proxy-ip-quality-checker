@@ -1,0 +1,15 @@
+Proxy IP Quality Checker - 本地免安装版
+=======================================
+
+直接双击 ipcheck.exe 使用，不需要安装 Docker、Git、Python 或其他软件。
+
+需要检测当前电脑自己的公网 IP 时，勾选“本机直连（不使用代理）”；地址、端口和协议会自动停用。直连检测会把当前公网出口 IP 暴露给所使用的公开检测服务。
+
+快速检测通常数秒完成；IPQuality 完整检测会运行原项目全部模块，通常需要数分钟。本机 127.0.0.1:7897 的 HTTP、SOCKS5，以及本机直连模式均已通过完整实测。
+
+完整检测成功后，同目录会保存：
+  ipquality-last-result.html
+  ipquality-last-original.html
+  ipquality-last-result.json
+  ipquality-last-result.txt
+  ipquality-last-result.meta.json

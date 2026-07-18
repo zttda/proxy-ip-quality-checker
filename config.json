@@ -1,7 +1,9 @@
 {
   "proxyHost": "127.0.0.1",
   "proxyPort": 7897,
+  "proxyProtocol": "auto",
+  "directConnection": false,
+  "checkMode": "quick",
   "timeoutSeconds": 20,
-  "saveJson": false,
-  "pauseOnExit": true
+  "pauseOnExit": false
 }
