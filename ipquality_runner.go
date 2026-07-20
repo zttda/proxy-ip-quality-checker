@@ -18,13 +18,6 @@ import (
 	"time"
 )
 
-const (
-	ipqualityHTMLName = "ipquality-last-result.html"
-	ipqualityJSONName = "ipquality-last-result.json"
-	ipqualityTextName = "ipquality-last-result.txt"
-	ipqualityMetaName = "ipquality-last-result.meta.json"
-)
-
 type ipqualityDocument struct {
 	Head   ipqualityHead                   `json:"Head"`
 	Info   ipqualityInfo                   `json:"Info"`

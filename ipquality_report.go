@@ -15,11 +15,6 @@ import (
 	"time"
 )
 
-const (
-	ipqualityErrorName        = "ipquality-last-error.txt"
-	ipqualityOriginalHTMLName = "ipquality-last-original.html"
-)
-
 type ipqualityHTMLView struct {
 	GeneratedAt     string
 	ProxyAddress    string
@@ -36,12 +31,16 @@ type ipqualityHTMLView struct {
 	TerminalHTML    template.HTML
 }
 
-func saveLatestIPQuality(directory string, result ipqualityResult) error {
+func saveLatestIPQuality(directory string, result ipqualityResult) (ipqualityReportFiles, error) {
 	if err := os.MkdirAll(directory, 0o755); err != nil {
-		return fmt.Errorf("创建报告目录失败: %w", err)
+		return ipqualityReportFiles{}, fmt.Errorf("创建报告目录失败: %w", err)
 	}
 	if _, err := parseIPQualityDocument(result.RawJSON); err != nil {
-		return fmt.Errorf("拒绝保存无效的原始结果: %w", err)
+		return ipqualityReportFiles{}, fmt.Errorf("拒绝保存无效的原始结果: %w", err)
+	}
+	reportFiles, err := ipqualityReportFilesForIP(directory, result.Document.Head.IP)
+	if err != nil {
+		return ipqualityReportFiles{}, err
 	}
 	metadata := ipqualityMetadata{
 		GeneratedAt:       result.GeneratedAt,
@@ -53,32 +52,32 @@ func saveLatestIPQuality(directory string, result ipqualityResult) error {
 	}
 	metaJSON, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
-		return fmt.Errorf("编码完整检测元数据失败: %w", err)
+		return ipqualityReportFiles{}, fmt.Errorf("编码完整检测元数据失败: %w", err)
 	}
 	htmlContent, err := renderIPQualityHTML(result)
 	if err != nil {
-		return fmt.Errorf("生成完整检测 HTML 失败: %w", err)
+		return ipqualityReportFiles{}, fmt.Errorf("生成完整检测 HTML 失败: %w", err)
 	}
 	originalHTML := renderTerminalDocument(ipqualityTerminalSource(result))
 	rawJSON := append(bytes.TrimSpace(result.RawJSON), '\n')
 	plainText := []byte(strings.TrimSpace(result.PlainText) + "\r\n")
-	files := []struct {
-		name    string
+	writes := []struct {
+		path    string
 		content []byte
 	}{
-		{ipqualityJSONName, rawJSON},
-		{ipqualityTextName, plainText},
-		{ipqualityMetaName, append(metaJSON, '\n')},
-		{ipqualityHTMLName, htmlContent},
-		{ipqualityOriginalHTMLName, originalHTML},
+		{reportFiles.JSON, rawJSON},
+		{reportFiles.Text, plainText},
+		{reportFiles.Metadata, append(metaJSON, '\n')},
+		{reportFiles.HTML, htmlContent},
+		{reportFiles.OriginalHTML, originalHTML},
 	}
-	for _, file := range files {
-		if err := os.WriteFile(filepath.Join(directory, file.name), file.content, 0o600); err != nil {
-			return fmt.Errorf("保存 %s 失败: %w", file.name, err)
+	for _, file := range writes {
+		if err := os.WriteFile(file.path, file.content, 0o600); err != nil {
+			return ipqualityReportFiles{}, fmt.Errorf("保存 %s 失败: %w", filepath.Base(file.path), err)
 		}
 	}
 	_ = os.Remove(filepath.Join(directory, ipqualityErrorName))
-	return nil
+	return reportFiles, nil
 }
 
 func saveIPQualityFailure(directory string, checkErr error) error {
@@ -86,8 +85,72 @@ func saveIPQualityFailure(directory string, checkErr error) error {
 	return os.WriteFile(filepath.Join(directory, ipqualityErrorName), []byte(content), 0o600)
 }
 
-func loadLatestIPQuality(directory string, fallback config) (ipqualityResult, error) {
-	rawJSON, err := os.ReadFile(filepath.Join(directory, ipqualityJSONName))
+func loadLatestIPQuality(directory string, fallback config) (ipqualityResult, ipqualityReportFiles, error) {
+	_ = migrateLegacyIPQualityReport(directory, fallback)
+	candidates, err := reportJSONCandidates(directory, "ipquality-", "-result.json")
+	if err != nil {
+		return ipqualityResult{}, ipqualityReportFiles{}, err
+	}
+	var latest ipqualityResult
+	var latestFiles ipqualityReportFiles
+	var latestTime time.Time
+	var firstErr error
+	for _, path := range candidates {
+		files := ipqualityReportFilesFromJSON(path)
+		result, loadErr := loadIPQualityReport(files, fallback)
+		if loadErr != nil {
+			if firstErr == nil {
+				firstErr = loadErr
+			}
+			continue
+		}
+		if latestFiles.JSON == "" || result.GeneratedAt.After(latestTime) {
+			latest = result
+			latestFiles = files
+			latestTime = result.GeneratedAt
+		}
+	}
+	if latestFiles.JSON != "" {
+		return latest, latestFiles, nil
+	}
+	if firstErr != nil {
+		return ipqualityResult{}, ipqualityReportFiles{}, firstErr
+	}
+	return ipqualityResult{}, ipqualityReportFiles{}, os.ErrNotExist
+}
+
+func migrateLegacyIPQualityReport(directory string, fallback config) error {
+	legacyFiles := ipqualityReportFilesFromJSON(filepath.Join(directory, "ipquality-last-result.json"))
+	legacyResult, err := loadIPQualityReport(legacyFiles, fallback)
+	if err != nil {
+		return err
+	}
+	targetFiles, err := ipqualityReportFilesForIP(directory, legacyResult.Document.Head.IP)
+	if err != nil {
+		return err
+	}
+	if targetResult, targetErr := loadIPQualityReport(targetFiles, fallback); targetErr == nil {
+		if !legacyResult.GeneratedAt.After(targetResult.GeneratedAt) {
+			return removeReportFiles(
+				legacyFiles.HTML,
+				legacyFiles.OriginalHTML,
+				legacyFiles.Text,
+				legacyFiles.Metadata,
+				legacyFiles.JSON,
+			)
+		}
+	}
+	return migrateReportFiles([]reportFilePair{
+		{source: legacyFiles.HTML, target: targetFiles.HTML},
+		{source: legacyFiles.OriginalHTML, target: targetFiles.OriginalHTML},
+		{source: legacyFiles.Text, target: targetFiles.Text},
+		{source: legacyFiles.Metadata, target: targetFiles.Metadata},
+		{source: legacyFiles.JSON, target: targetFiles.JSON},
+	})
+}
+
+func loadIPQualityReport(files ipqualityReportFiles, fallback config) (ipqualityResult, error) {
+	rawJSON, err := os.ReadFile(files.JSON)
 	if err != nil {
 		return ipqualityResult{}, err
 	}
@@ -103,17 +166,17 @@ func loadLatestIPQuality(directory string, fallback config) (ipqualityResult, er
 		Document:      document,
 		RawJSON:       rawJSON,
 	}
-	if info, statErr := os.Stat(filepath.Join(directory, ipqualityJSONName)); statErr == nil {
+	if info, statErr := os.Stat(files.JSON); statErr == nil {
 		result.GeneratedAt = info.ModTime().UTC()
 	}
-	if content, readErr := os.ReadFile(filepath.Join(directory, ipqualityTextName)); readErr == nil {
+	if content, readErr := os.ReadFile(files.Text); readErr == nil {
 		result.PlainText = cleanIPQualityText(string(content))
 	}
 	if result.PlainText == "" {
 		result.PlainText = buildIPQualityPlainText(document)
 	}
 	enrichIPQualityDocumentFromText(&result.Document, result.PlainText)
-	if content, readErr := os.ReadFile(filepath.Join(directory, ipqualityMetaName)); readErr == nil {
+	if content, readErr := os.ReadFile(files.Metadata); readErr == nil {
 		var metadata ipqualityMetadata
 		if json.Unmarshal(content, &metadata) == nil {
 			if !metadata.GeneratedAt.IsZero() {

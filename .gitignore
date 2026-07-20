@@ -5,8 +5,17 @@ dist/
 ipcheck-result.json
 ipcheck-last-result.html
 ipcheck-last-result.json
+ipcheck-last-error.html
+ipcheck-last-error.json
+ipcheck-*-result.html
+ipcheck-*-result.json
 ipquality-last-result.html
 ipquality-last-result.json
 ipquality-last-result.txt
 ipquality-last-result.meta.json
 ipquality-last-error.txt
+ipquality-*-result.html
+ipquality-*-original.html
+ipquality-*-result.json
+ipquality-*-result.txt
+ipquality-*-result.meta.json

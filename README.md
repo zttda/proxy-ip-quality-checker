@@ -20,7 +20,7 @@
 - `7897`、`7890`、`1080` 常用端口按钮
 - 自动识别、HTTP / Mixed、SOCKS5 协议选择
 - “本机直连（不使用代理）”开关；启用后自动停用代理地址、端口和协议控件
-- 快速检测、IPQuality 完整检测模式选择
+- 快速检测、IPQuality 完整检测模式选择，默认使用完整检测
 - 后台运行、进度显示和取消
 - 指标概览与 IPQuality 原始报告标签页
 - 一键复制摘要、打开 HTML 报告、打开报告目录
@@ -53,20 +53,20 @@ IPQuality 完整模式保留原项目的六个部分：
 
 ## 本地报告
 
-快速检测完成后生成：
+快速检测完成后生成（以出口 `203.0.113.10` 为例）：
 
-- `ipcheck-last-result.html`
-- `ipcheck-last-result.json`
+- `ipcheck-203.0.113.10-result.html`
+- `ipcheck-203.0.113.10-result.json`
 
 IPQuality 完整检测完成后生成：
 
-- `ipquality-last-result.html`：解析指标和原始文本合并报告
-- `ipquality-last-original.html`：保留上游深色背景、ANSI 字体颜色和等宽排版的原始报告
-- `ipquality-last-result.json`：原项目生成的原始 JSON，不增加包装字段
-- `ipquality-last-result.txt`：去除终端颜色后的原始文本报告
-- `ipquality-last-result.meta.json`：本工具保存的协议和生成时间等元数据
+- `ipquality-203.0.113.10-result.html`：解析指标和原始文本合并报告
+- `ipquality-203.0.113.10-original.html`：保留上游深色背景、ANSI 字体颜色和等宽排版的原始报告
+- `ipquality-203.0.113.10-result.json`：原项目生成的原始 JSON，不增加包装字段
+- `ipquality-203.0.113.10-result.txt`：去除终端颜色后的原始文本报告
+- `ipquality-203.0.113.10-result.meta.json`：本工具保存的协议和生成时间等元数据
 
-所有文件都保存在 `ipcheck.exe` 同一目录。检测失败时另存 `ipquality-last-error.txt`，不会删除之前成功的完整报告。
+所有文件都保存在 `ipcheck.exe` 同一目录。不同出口 IP 的报告分别保留；同一出口 IP 再次检测时只更新该 IP 对应的文件。程序启动时会扫描这些文件并恢复时间最新的结果；旧版本的 `*-last-result.*` 报告会在确认内容有效后自动迁移为带出口 IP 的文件名，如果同一 IP 已有新报告则只保留时间更新的那组。检测失败时另存错误文件，不会删除之前成功的报告。
 
 ## 配置文件
 
@@ -76,13 +76,13 @@ IPQuality 完整检测完成后生成：
   "proxyPort": 7897,
   "proxyProtocol": "auto",
   "directConnection": false,
-  "checkMode": "quick",
+  "checkMode": "ipquality",
   "timeoutSeconds": 20,
   "pauseOnExit": false
 }
 ```
 
-`directConnection` 为 `true` 时完全绕过代理，地址、端口和协议仅保留配置但不参与检测。`proxyProtocol` 支持 `auto`、`http`、`socks5`；`checkMode` 支持 `quick`、`ipquality`。旧配置没有新增字段时仍使用代理快速检测。
+`directConnection` 为 `true` 时完全绕过代理，地址、端口和协议仅保留配置但不参与检测。`proxyProtocol` 支持 `auto`、`http`、`socks5`；`checkMode` 支持 `quick`、`ipquality`。新配置以及没有 `checkMode` 的旧配置默认使用完整检测；已经明确保存过模式的配置继续尊重原选择。
 
 ## 依赖与打包
 

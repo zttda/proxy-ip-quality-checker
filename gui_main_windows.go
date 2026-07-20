@@ -90,7 +90,9 @@ type appUI struct {
 	loading             bool
 	cancel              context.CancelFunc
 	latestResult        *report
+	latestQuickFiles    quickReportFiles
 	latestIPQuality     *ipqualityResult
+	latestFullFiles     ipqualityReportFiles
 	displayedResultMode string
 	closed              atomic.Bool
 }
@@ -327,7 +329,16 @@ func (ui *appUI) initOriginalReportViewer() {
 }
 
 func (ui *appUI) showOriginalIPQualityReport(result ipqualityResult) {
-	path := filepath.Join(ui.appDir, ipqualityOriginalHTMLName)
+	path := ui.latestFullFiles.OriginalHTML
+	if path == "" {
+		if files, err := ipqualityReportFilesForIP(ui.appDir, result.Document.Head.IP); err == nil {
+			path = files.OriginalHTML
+		}
+	}
+	if path == "" {
+		ui.showOriginalReportMessage(result.PlainText)
+		return
+	}
 	if !fileExists(path) {
 		if err := os.WriteFile(path, renderTerminalDocument(ipqualityTerminalSource(result)), 0o600); err != nil {
 			ui.appendLog("生成原始彩色报告失败：" + err.Error())
@@ -496,8 +507,9 @@ func (ui *appUI) startCheck() {
 
 func (ui *appUI) runQuickCheck(ctx context.Context, cfg config, previous *report) {
 	result, checkErr := performCheck(ctx, cfg, ui.progressCallback())
+	var savedFiles quickReportFiles
 	if checkErr == nil {
-		checkErr = saveLatestSuccess(ui.appDir, cfg, result)
+		savedFiles, checkErr = saveLatestSuccess(ui.appDir, cfg, result)
 	}
 	if checkErr != nil && !errors.Is(checkErr, context.Canceled) {
 		if saveErr := saveLatestFailure(ui.appDir, cfg, checkErr); saveErr != nil {
@@ -515,14 +527,15 @@ func (ui *appUI) runQuickCheck(ctx context.Context, cfg config, previous *report
 			ui.showFailure(checkErr, checkModeQuick)
 			return
 		}
-		ui.showResult(result)
+		ui.showResult(result, savedFiles)
 	})
 }
 
 func (ui *appUI) runFullCheck(ctx context.Context, cfg config, previous *ipqualityResult) {
 	result, checkErr := performIPQualityCheck(ctx, ui.appDir, cfg, ui.progressCallback())
+	var savedFiles ipqualityReportFiles
 	if checkErr == nil {
-		checkErr = saveLatestIPQuality(ui.appDir, result)
+		savedFiles, checkErr = saveLatestIPQuality(ui.appDir, result)
 	}
 	if checkErr != nil && !errors.Is(checkErr, context.Canceled) {
 		if saveErr := saveIPQualityFailure(ui.appDir, checkErr); saveErr != nil {
@@ -540,7 +553,7 @@ func (ui *appUI) runFullCheck(ctx context.Context, cfg config, previous *ipquali
 			ui.showFailure(checkErr, checkModeFull)
 			return
 		}
-		ui.showIPQualityResult(result)
+		ui.showIPQualityResult(result, savedFiles)
 	})
 }
 
@@ -584,7 +597,8 @@ func (ui *appUI) setRunning(running bool) {
 	ui.updateReportButton()
 }
 
-func (ui *appUI) showResult(result report) {
+func (ui *appUI) showResult(result report, files quickReportFiles) {
+	ui.latestQuickFiles = files
 	ui.applyResult(result)
 	_ = ui.resultTabs.SetCurrentIndex(0)
 	label, _ := assessmentLabel(result.Assessment)
@@ -592,7 +606,7 @@ func (ui *appUI) showResult(result report) {
 	ui.statusLabel.SetText("检测完成，结果已保存")
 	ui.statusBar.SetText("检测完成 · 结果已保存")
 	ui.openLastButton.SetEnabled(true)
-	ui.appendLog(fmt.Sprintf("检测完成：出口 %s，%s，已保存 %s", result.Intel.IP, label, latestHTMLName))
+	ui.appendLog(fmt.Sprintf("检测完成：出口 %s，%s，已保存 %s", result.Intel.IP, label, filepath.Base(files.HTML)))
 }
 
 func (ui *appUI) applyResult(result report) {
@@ -609,7 +623,8 @@ func (ui *appUI) applyResult(result report) {
 	ui.copyButton.SetEnabled(true)
 }
 
-func (ui *appUI) showIPQualityResult(result ipqualityResult) {
+func (ui *appUI) showIPQualityResult(result ipqualityResult, files ipqualityReportFiles) {
+	ui.latestFullFiles = files
 	ui.applyIPQualityResult(result)
 	_ = ui.resultTabs.SetCurrentIndex(1)
 	label, _ := assessmentLabel(result.Assessment)
@@ -617,7 +632,7 @@ func (ui *appUI) showIPQualityResult(result ipqualityResult) {
 	ui.statusLabel.SetText("完整检测完成，原始报告已保存")
 	ui.statusBar.SetText("IPQuality 完整检测完成 · 结果已保存")
 	ui.updateReportButton()
-	ui.appendLog(fmt.Sprintf("完整检测完成：出口 %s，%s，已保存 %s", result.Document.Head.IP, label, ipqualityHTMLName))
+	ui.appendLog(fmt.Sprintf("完整检测完成：出口 %s，%s，已保存 %s", result.Document.Head.IP, label, filepath.Base(files.HTML)))
 }
 
 func (ui *appUI) applyIPQualityResult(result ipqualityResult) {
@@ -657,17 +672,18 @@ func (ui *appUI) showFailure(checkErr error, mode string) {
 }
 
 func (ui *appUI) loadLastResults(cfg config) {
-	jsonPath := filepath.Join(ui.appDir, latestJSONName)
-	session, err := loadLatestSession(jsonPath)
+	session, quickFiles, err := loadLatestQuickSession(ui.appDir)
 	if err == nil && session.Success && session.Result != nil {
 		ui.latestResult = session.Result
+		ui.latestQuickFiles = quickFiles
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		ui.appendLog("读取快速检测结果失败：" + err.Error())
 	}
 
-	fullResult, fullErr := loadLatestIPQuality(ui.appDir, cfg)
+	fullResult, fullFiles, fullErr := loadLatestIPQuality(ui.appDir, cfg)
 	if fullErr == nil {
 		ui.latestIPQuality = &fullResult
+		ui.latestFullFiles = fullFiles
 	} else if !errors.Is(fullErr, os.ErrNotExist) {
 		ui.appendLog("读取 IPQuality 结果失败：" + fullErr.Error())
 	}
@@ -830,11 +846,10 @@ func (ui *appUI) openLastReport() {
 }
 
 func (ui *appUI) activeReportPath() string {
-	name := latestHTMLName
 	if ui.displayedResultMode == checkModeFull {
-		name = ipqualityHTMLName
+		return ui.latestFullFiles.HTML
 	}
-	return filepath.Join(ui.appDir, name)
+	return ui.latestQuickFiles.HTML
 }
 
 func (ui *appUI) updateReportButton() {

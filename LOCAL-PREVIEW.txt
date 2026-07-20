@@ -8,8 +8,10 @@ Proxy IP Quality Checker - 本地免安装版
 快速检测通常数秒完成；IPQuality 完整检测会运行原项目全部模块，通常需要数分钟。本机 127.0.0.1:7897 的 HTTP、SOCKS5，以及本机直连模式均已通过完整实测。
 
 完整检测成功后，同目录会保存：
-  ipquality-last-result.html
-  ipquality-last-original.html
-  ipquality-last-result.json
-  ipquality-last-result.txt
-  ipquality-last-result.meta.json
+  ipquality-<出口IP>-result.html
+  ipquality-<出口IP>-original.html
+  ipquality-<出口IP>-result.json
+  ipquality-<出口IP>-result.txt
+  ipquality-<出口IP>-result.meta.json
+
+不同出口 IP 的报告会分别保留；同一个出口 IP 再检测时只保留最新一组。程序默认使用 IPQuality 完整检测。

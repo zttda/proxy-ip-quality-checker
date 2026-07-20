@@ -11,11 +11,6 @@ import (
 	"time"
 )
 
-const (
-	latestHTMLName = "ipcheck-last-result.html"
-	latestJSONName = "ipcheck-last-result.json"
-)
-
 type savedSession struct {
 	Success     bool      `json:"success"`
 	GeneratedAt time.Time `json:"generatedAt"`
@@ -55,13 +50,18 @@ type htmlReportView struct {
 	Reasons         []string
 }
 
-func saveLatestSuccess(directory string, cfg config, result report) error {
-	return saveLatestSession(directory, savedSession{
+func saveLatestSuccess(directory string, cfg config, result report) (quickReportFiles, error) {
+	files, err := quickReportFilesForIP(directory, result.Intel.IP)
+	if err != nil {
+		return quickReportFiles{}, err
+	}
+	err = saveLatestSession(directory, savedSession{
 		Success:     true,
 		GeneratedAt: result.GeneratedAt,
 		Config:      cfg,
 		Result:      &result,
-	})
+	}, files)
+	return files, err
 }
 
 func saveLatestFailure(directory string, cfg config, checkErr error) error {
@@ -70,10 +70,13 @@ func saveLatestFailure(directory string, cfg config, checkErr error) error {
 		GeneratedAt: time.Now().UTC(),
 		Config:      cfg,
 		Error:       sanitize(checkErr.Error()),
+	}, quickReportFiles{
+		HTML: filepath.Join(directory, quickErrorHTMLName),
+		JSON: filepath.Join(directory, quickErrorJSONName),
 	})
 }
 
-func saveLatestSession(directory string, session savedSession) error {
+func saveLatestSession(directory string, session savedSession, files quickReportFiles) error {
 	if err := os.MkdirAll(directory, 0o755); err != nil {
 		return fmt.Errorf("create report directory: %w", err)
 	}
@@ -86,10 +89,10 @@ func saveLatestSession(directory string, session savedSession) error {
 	if err != nil {
 		return fmt.Errorf("render HTML report: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(directory, latestJSONName), jsonContent, 0o600); err != nil {
+	if err := os.WriteFile(files.JSON, jsonContent, 0o600); err != nil {
 		return fmt.Errorf("write JSON report: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(directory, latestHTMLName), htmlContent, 0o600); err != nil {
+	if err := os.WriteFile(files.HTML, htmlContent, 0o600); err != nil {
 		return fmt.Errorf("write HTML report: %w", err)
 	}
 	return nil
@@ -105,6 +108,83 @@ func loadLatestSession(path string) (savedSession, error) {
 		return savedSession{}, fmt.Errorf("parse saved result: %w", err)
 	}
 	return session, nil
+}
+
+func loadLatestQuickSession(directory string) (savedSession, quickReportFiles, error) {
+	_ = migrateLegacyQuickReport(directory)
+	candidates, err := reportJSONCandidates(directory, "ipcheck-", "-result.json")
+	if err != nil {
+		return savedSession{}, quickReportFiles{}, err
+	}
+	var latest savedSession
+	var latestFiles quickReportFiles
+	var latestTime time.Time
+	var firstErr error
+	for _, path := range candidates {
+		session, loadErr := loadLatestSession(path)
+		if loadErr != nil {
+			if firstErr == nil {
+				firstErr = loadErr
+			}
+			continue
+		}
+		if !session.Success || session.Result == nil {
+			continue
+		}
+		if _, tokenErr := reportIPToken(session.Result.Intel.IP); tokenErr != nil {
+			if firstErr == nil {
+				firstErr = tokenErr
+			}
+			continue
+		}
+		generatedAt := quickSessionTime(session, path)
+		if latestFiles.JSON == "" || generatedAt.After(latestTime) {
+			latest = session
+			latestFiles = quickReportFilesFromJSON(path)
+			latestTime = generatedAt
+		}
+	}
+	if latestFiles.JSON != "" {
+		return latest, latestFiles, nil
+	}
+	if firstErr != nil {
+		return savedSession{}, quickReportFiles{}, firstErr
+	}
+	return savedSession{}, quickReportFiles{}, os.ErrNotExist
+}
+
+func migrateLegacyQuickReport(directory string) error {
+	legacyFiles := quickReportFilesFromJSON(filepath.Join(directory, "ipcheck-last-result.json"))
+	legacySession, err := loadLatestSession(legacyFiles.JSON)
+	if err != nil || !legacySession.Success || legacySession.Result == nil {
+		return err
+	}
+	targetFiles, err := quickReportFilesForIP(directory, legacySession.Result.Intel.IP)
+	if err != nil {
+		return err
+	}
+	if targetSession, targetErr := loadLatestSession(targetFiles.JSON); targetErr == nil && targetSession.Success && targetSession.Result != nil {
+		if !quickSessionTime(legacySession, legacyFiles.JSON).After(quickSessionTime(targetSession, targetFiles.JSON)) {
+			return removeReportFiles(legacyFiles.HTML, legacyFiles.JSON)
+		}
+	}
+	return migrateReportFiles([]reportFilePair{
+		{source: legacyFiles.HTML, target: targetFiles.HTML},
+		{source: legacyFiles.JSON, target: targetFiles.JSON},
+	})
+}
+
+func quickSessionTime(session savedSession, jsonPath string) time.Time {
+	generatedAt := session.GeneratedAt
+	if generatedAt.IsZero() && session.Result != nil {
+		generatedAt = session.Result.GeneratedAt
+	}
+	if generatedAt.IsZero() {
+		if info, err := os.Stat(jsonPath); err == nil {
+			generatedAt = info.ModTime()
+		}
+	}
+	return generatedAt
 }
 
 func saveConfig(path string, cfg config) error {

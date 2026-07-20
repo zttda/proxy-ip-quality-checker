@@ -69,17 +69,24 @@ func TestSaveAndLoadIPQualityReport(t *testing.T) {
 		AssessmentReasons: reasons,
 	}
 	directory := t.TempDir()
-	if err := saveLatestIPQuality(directory, result); err != nil {
+	files, err := saveLatestIPQuality(directory, result)
+	if err != nil {
 		t.Fatalf("saveLatestIPQuality() error = %v", err)
 	}
-	loaded, err := loadLatestIPQuality(directory, defaultConfig())
+	if filepath.Base(files.HTML) != "ipquality-203.0.113.24-result.html" {
+		t.Fatalf("saved HTML name = %q", filepath.Base(files.HTML))
+	}
+	loaded, loadedFiles, err := loadLatestIPQuality(directory, defaultConfig())
 	if err != nil {
 		t.Fatalf("loadLatestIPQuality() error = %v", err)
+	}
+	if loadedFiles != files {
+		t.Fatalf("loaded files = %#v, want %#v", loadedFiles, files)
 	}
 	if loaded.Document.Head.IP != "203.0.113.24" || loaded.ProxyProtocol != protocolSOCKS5 {
 		t.Fatalf("loaded result = %#v", loaded)
 	}
-	htmlContent, err := os.ReadFile(filepath.Join(directory, ipqualityHTMLName))
+	htmlContent, err := os.ReadFile(files.HTML)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,14 +94,14 @@ func TestSaveAndLoadIPQualityReport(t *testing.T) {
 	if !strings.Contains(htmlText, "IPQuality 原始文本报告") || strings.Contains(htmlText, "Example <Network>") || strings.Contains(htmlText, "<unsafe>") {
 		t.Fatalf("HTML report is missing content or failed to escape untrusted values")
 	}
-	rawContent, err := os.ReadFile(filepath.Join(directory, ipqualityJSONName))
+	rawContent, err := os.ReadFile(files.JSON)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(rawContent), `"Head"`) || strings.Contains(string(rawContent), `"_ProxyIPCheck"`) {
 		t.Fatalf("saved JSON is not the unwrapped upstream document")
 	}
-	originalContent, err := os.ReadFile(filepath.Join(directory, ipqualityOriginalHTMLName))
+	originalContent, err := os.ReadFile(files.OriginalHTML)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,6 +111,106 @@ func TestSaveAndLoadIPQualityReport(t *testing.T) {
 	}
 	if strings.Contains(originalHTML, "<unsafe>") || !strings.Contains(originalHTML, "&lt;unsafe&gt;") {
 		t.Fatalf("standalone original report did not escape terminal text")
+	}
+}
+
+func TestIPQualityReportsRetainDifferentIPsAndReplaceSameIP(t *testing.T) {
+	directory := t.TempDir()
+	first := sampleIPQualityResultForIP(t, "203.0.113.24", time.Date(2026, 7, 18, 1, 0, 0, 0, time.UTC))
+	secondIP := sampleIPQualityResultForIP(t, "198.51.100.25", time.Date(2026, 7, 18, 2, 0, 0, 0, time.UTC))
+	latestFirstIP := sampleIPQualityResultForIP(t, "203.0.113.24", time.Date(2026, 7, 18, 3, 0, 0, 0, time.UTC))
+	latestFirstIP.PlainText = "latest report for first IP"
+
+	if _, err := saveLatestIPQuality(directory, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := saveLatestIPQuality(directory, secondIP); err != nil {
+		t.Fatal(err)
+	}
+	firstFiles, err := saveLatestIPQuality(directory, latestFirstIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jsonFiles, err := filepath.Glob(filepath.Join(directory, "ipquality-*-result.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jsonFiles) != 2 {
+		t.Fatalf("saved IPQuality report groups = %d, want 2: %v", len(jsonFiles), jsonFiles)
+	}
+	textContent, err := os.ReadFile(firstFiles.Text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(textContent), "latest report for first IP") {
+		t.Fatalf("same-IP text report was not replaced: %q", textContent)
+	}
+	latest, latestFiles, err := loadLatestIPQuality(directory, defaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.Document.Head.IP != "203.0.113.24" || latestFiles != firstFiles {
+		t.Fatalf("latest IPQuality report = %s, files = %#v", latest.Document.Head.IP, latestFiles)
+	}
+}
+
+func TestLoadLatestIPQualitySupportsLegacyFilenames(t *testing.T) {
+	directory := t.TempDir()
+	result := sampleIPQualityResultForIP(t, "203.0.113.40", time.Date(2026, 7, 18, 1, 0, 0, 0, time.UTC))
+	currentFiles, err := saveLatestIPQuality(directory, result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyFiles := ipqualityReportFilesFromJSON(filepath.Join(directory, "ipquality-last-result.json"))
+	filePairs := [][2]string{
+		{currentFiles.HTML, legacyFiles.HTML},
+		{currentFiles.OriginalHTML, legacyFiles.OriginalHTML},
+		{currentFiles.JSON, legacyFiles.JSON},
+		{currentFiles.Text, legacyFiles.Text},
+		{currentFiles.Metadata, legacyFiles.Metadata},
+	}
+	for _, pair := range filePairs {
+		if err := os.Rename(pair[0], pair[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	loaded, files, err := loadLatestIPQuality(directory, defaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	migratedFiles, err := ipqualityReportFilesForIP(directory, result.Document.Head.IP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Document.Head.IP != result.Document.Head.IP || files != migratedFiles {
+		t.Fatalf("legacy IPQuality report was not restored: %s, %#v", loaded.Document.Head.IP, files)
+	}
+	if _, err := os.Stat(legacyFiles.JSON); !os.IsNotExist(err) {
+		t.Fatalf("legacy IPQuality JSON still exists after migration: %v", err)
+	}
+}
+
+func sampleIPQualityResultForIP(t *testing.T, ip string, generatedAt time.Time) ipqualityResult {
+	t.Helper()
+	rawJSON := strings.Replace(sampleIPQualityJSON, "203.0.113.24", ip, 1)
+	document, err := parseIPQualityDocument([]byte(rawJSON))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assessment, reasons := assessIPQuality(document)
+	return ipqualityResult{
+		GeneratedAt:       generatedAt,
+		ProxyHost:         "127.0.0.1",
+		ProxyPort:         7897,
+		ProxyProtocol:     protocolHTTP,
+		Document:          document,
+		RawJSON:           []byte(rawJSON),
+		TerminalText:      "sample terminal report",
+		PlainText:         "sample plain report",
+		Assessment:        assessment,
+		AssessmentReasons: reasons,
 	}
 }
 

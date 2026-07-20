@@ -149,7 +149,7 @@ func defaultConfig() config {
 		ProxyPort:   7897,
 		Protocol:    protocolAuto,
 		Direct:      false,
-		CheckMode:   checkModeQuick,
+		CheckMode:   checkModeFull,
 		Timeout:     20,
 		PauseOnExit: true,
 	}
@@ -239,11 +239,11 @@ func configConnectionSummary(cfg config) string {
 
 func normalizeCheckMode(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
-	if value == "" || value == "fast" {
-		return checkModeQuick
-	}
-	if value == "full" {
+	if value == "" || value == "full" {
 		return checkModeFull
+	}
+	if value == "fast" {
+		return checkModeQuick
 	}
 	return value
 }
@@ -290,10 +290,11 @@ func run(cfg config, configPath string) int {
 	}
 
 	printReport(result)
-	if err := saveLatestSuccess(filepath.Dir(configPath), cfg, result); err != nil {
-		fmt.Fprintf(os.Stderr, "WARNING: could not save result files: %v\n", err)
+	files, saveErr := saveLatestSuccess(filepath.Dir(configPath), cfg, result)
+	if saveErr != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: could not save result files: %v\n", saveErr)
 	} else {
-		fmt.Printf("\nSaved report: %s\n", filepath.Join(filepath.Dir(configPath), latestHTMLName))
+		fmt.Printf("\nSaved report: %s\n", files.HTML)
 	}
 	return 0
 }
@@ -309,12 +310,13 @@ func runIPQualityCLI(cfg config, directory string) int {
 		}
 		return 1
 	}
-	if err := saveLatestIPQuality(directory, result); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: could not save IPQuality reports: %v\n", err)
+	files, saveErr := saveLatestIPQuality(directory, result)
+	if saveErr != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: could not save IPQuality reports: %v\n", saveErr)
 		return 1
 	}
 	fmt.Println(result.PlainText)
-	fmt.Printf("\nSaved report: %s\n", filepath.Join(directory, ipqualityHTMLName))
+	fmt.Printf("\nSaved report: %s\n", files.HTML)
 	return 0
 }
 

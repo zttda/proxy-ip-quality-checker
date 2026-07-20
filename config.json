@@ -3,7 +3,7 @@
   "proxyPort": 7897,
   "proxyProtocol": "auto",
   "directConnection": false,
-  "checkMode": "quick",
+  "checkMode": "ipquality",
   "timeoutSeconds": 20,
   "pauseOnExit": false
 }

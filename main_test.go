@@ -105,7 +105,7 @@ func TestNewConnectionClientDirectDisablesProxy(t *testing.T) {
 
 func TestNormalizeCheckMode(t *testing.T) {
 	tests := map[string]string{
-		"":          checkModeQuick,
+		"":          checkModeFull,
 		"fast":      checkModeQuick,
 		"quick":     checkModeQuick,
 		"full":      checkModeFull,
@@ -115,6 +115,12 @@ func TestNormalizeCheckMode(t *testing.T) {
 		if actual := normalizeCheckMode(input); actual != expected {
 			t.Fatalf("normalizeCheckMode(%q) = %q, want %q", input, actual, expected)
 		}
+	}
+}
+
+func TestDefaultConfigUsesFullCheck(t *testing.T) {
+	if mode := normalizeCheckMode(defaultConfig().CheckMode); mode != checkModeFull {
+		t.Fatalf("default check mode = %q, want %q", mode, checkModeFull)
 	}
 }
 
@@ -155,10 +161,14 @@ func TestSaveAndLoadLatestReport(t *testing.T) {
 		},
 	}
 
-	if err := saveLatestSuccess(directory, cfg, result); err != nil {
+	files, err := saveLatestSuccess(directory, cfg, result)
+	if err != nil {
 		t.Fatalf("saveLatestSuccess() error = %v", err)
 	}
-	session, err := loadLatestSession(filepath.Join(directory, latestJSONName))
+	if filepath.Base(files.JSON) != "ipcheck-203.0.113.10-result.json" {
+		t.Fatalf("saved JSON name = %q", filepath.Base(files.JSON))
+	}
+	session, err := loadLatestSession(files.JSON)
 	if err != nil {
 		t.Fatalf("loadLatestSession() error = %v", err)
 	}
@@ -166,7 +176,7 @@ func TestSaveAndLoadLatestReport(t *testing.T) {
 		t.Fatalf("loaded session = %#v", session)
 	}
 
-	htmlContent, err := os.ReadFile(filepath.Join(directory, latestHTMLName))
+	htmlContent, err := os.ReadFile(files.HTML)
 	if err != nil {
 		t.Fatalf("read HTML report: %v", err)
 	}
@@ -176,6 +186,143 @@ func TestSaveAndLoadLatestReport(t *testing.T) {
 	}
 	if strings.Contains(htmlText, "Test <Country>") || strings.Contains(htmlText, "Example & ISP") {
 		t.Fatalf("HTML report did not escape API-provided text")
+	}
+}
+
+func TestQuickReportsRetainDifferentIPsAndReplaceSameIP(t *testing.T) {
+	directory := t.TempDir()
+	cfg := defaultConfig()
+	first := report{
+		GeneratedAt:   time.Date(2026, 7, 18, 1, 0, 0, 0, time.UTC),
+		ProxyProtocol: protocolHTTP,
+		Intel: intelData{
+			IP:      "203.0.113.10",
+			Version: "IPv4",
+			Network: networkData{ISP: "first"},
+		},
+	}
+	secondIP := first
+	secondIP.GeneratedAt = time.Date(2026, 7, 18, 2, 0, 0, 0, time.UTC)
+	secondIP.Intel.IP = "198.51.100.20"
+	secondIP.Intel.Network.ISP = "second IP"
+	latestFirstIP := first
+	latestFirstIP.GeneratedAt = time.Date(2026, 7, 18, 3, 0, 0, 0, time.UTC)
+	latestFirstIP.Intel.Network.ISP = "latest first IP"
+
+	if _, err := saveLatestSuccess(directory, cfg, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := saveLatestSuccess(directory, cfg, secondIP); err != nil {
+		t.Fatal(err)
+	}
+	firstFiles, err := saveLatestSuccess(directory, cfg, latestFirstIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jsonFiles, err := filepath.Glob(filepath.Join(directory, "ipcheck-*-result.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jsonFiles) != 2 {
+		t.Fatalf("saved quick report groups = %d, want 2: %v", len(jsonFiles), jsonFiles)
+	}
+	firstSession, err := loadLatestSession(firstFiles.JSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstSession.Result == nil || firstSession.Result.Intel.Network.ISP != "latest first IP" {
+		t.Fatalf("same-IP report was not replaced: %#v", firstSession.Result)
+	}
+	latest, latestFiles, err := loadLatestQuickSession(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.Result == nil || latest.Result.Intel.IP != "203.0.113.10" || latestFiles.JSON != firstFiles.JSON {
+		t.Fatalf("latest quick report = %#v, files = %#v", latest.Result, latestFiles)
+	}
+}
+
+func TestLoadLatestQuickSessionSupportsLegacyFilename(t *testing.T) {
+	directory := t.TempDir()
+	result := report{
+		GeneratedAt:   time.Date(2026, 7, 18, 1, 0, 0, 0, time.UTC),
+		ProxyProtocol: protocolHTTP,
+		Intel:         intelData{IP: "203.0.113.30", Version: "IPv4"},
+	}
+	legacyFiles := quickReportFilesFromJSON(filepath.Join(directory, "ipcheck-last-result.json"))
+	if err := saveLatestSession(directory, savedSession{
+		Success:     true,
+		GeneratedAt: result.GeneratedAt,
+		Config:      defaultConfig(),
+		Result:      &result,
+	}, legacyFiles); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, files, err := loadLatestQuickSession(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migratedFiles, err := quickReportFilesForIP(directory, result.Intel.IP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Result == nil || loaded.Result.Intel.IP != result.Intel.IP || files != migratedFiles {
+		t.Fatalf("legacy quick report was not restored: %#v, %#v", loaded.Result, files)
+	}
+	if _, err := os.Stat(legacyFiles.JSON); !os.IsNotExist(err) {
+		t.Fatalf("legacy quick JSON still exists after migration: %v", err)
+	}
+}
+
+func TestLegacyQuickMigrationKeepsNewerIPNamedReport(t *testing.T) {
+	directory := t.TempDir()
+	cfg := defaultConfig()
+	newer := report{
+		GeneratedAt:   time.Date(2026, 7, 18, 2, 0, 0, 0, time.UTC),
+		ProxyProtocol: protocolHTTP,
+		Intel: intelData{
+			IP:      "203.0.113.50",
+			Version: "IPv4",
+			Network: networkData{ISP: "newer"},
+		},
+	}
+	if _, err := saveLatestSuccess(directory, cfg, newer); err != nil {
+		t.Fatal(err)
+	}
+	older := newer
+	older.GeneratedAt = time.Date(2026, 7, 18, 1, 0, 0, 0, time.UTC)
+	older.Intel.Network.ISP = "older legacy"
+	legacyFiles := quickReportFilesFromJSON(filepath.Join(directory, "ipcheck-last-result.json"))
+	if err := saveLatestSession(directory, savedSession{
+		Success:     true,
+		GeneratedAt: older.GeneratedAt,
+		Config:      cfg,
+		Result:      &older,
+	}, legacyFiles); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, _, err := loadLatestQuickSession(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Result == nil || loaded.Result.Intel.Network.ISP != "newer" {
+		t.Fatalf("older legacy report replaced the newer report: %#v", loaded.Result)
+	}
+	if _, err := os.Stat(legacyFiles.JSON); !os.IsNotExist(err) {
+		t.Fatalf("older legacy JSON still exists after deduplication: %v", err)
+	}
+}
+
+func TestReportIPTokenSupportsIPv6(t *testing.T) {
+	token, err := reportIPToken("2001:db8::1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "2001-db8--1" {
+		t.Fatalf("IPv6 report token = %q", token)
 	}
 }
 
